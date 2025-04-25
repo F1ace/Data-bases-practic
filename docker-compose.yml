@@ -1,0 +1,74 @@
+services:
+  redis:
+    image: redis:latest
+    volumes:
+      - ./redis_data:/data
+    ports:
+      - "6379:6379"
+    networks:
+      - db-network
+
+  mongodb:
+    image: mongo:latest
+    ports:
+      - "27017:27017"
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=admin
+      - MONGO_INITDB_ROOT_PASSWORD=secret
+    volumes:
+      - ./mongodb_data:/data/db
+    networks:
+      - db-network
+
+  neo4j:
+    image: neo4j:5.24.1-community
+    container_name: neo4j
+    environment:
+      - NEO4J_AUTH=neo4j/strongpassword 
+    ports:
+      - "7474:7474"   
+      - "7687:7687"  
+    volumes:
+      - ./neo4j_data:/data    
+      - ./neo4j_logs:/logs    
+      - ./neo4j_import:/import 
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "strongpassword", "RETURN 1;"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    networks:
+      - db-network
+
+  elasticsearch:
+    image: elasticsearch:8.16.4
+    ports:
+      - "9200:9200"
+      - "9300:9300"
+    environment:
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xms1g -Xmx1g
+      - ELASTIC_PASSWORD=secret
+    volumes:
+      - ./elastic_data:/usr/share/elasticsearch/data
+    networks:
+      - db-network
+
+  postgres:
+    image: postgres:latest
+    container_name: postgres_container
+    environment:
+      POSTGRES_USER: postgres_user
+      POSTGRES_PASSWORD: postgres_password
+      POSTGRES_DB: postgres_db
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "5430:5432"
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data/pgdata
+    networks:
+      - db-network
+
+networks:
+  db-network:
+    external: true

@@ -1,0 +1,1 @@
+psql -d postgres_db -p 5432 -U postgres_user -W - подключиться по паролю postgres_password

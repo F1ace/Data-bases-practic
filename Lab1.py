@@ -1,137 +1,193 @@
-from datetime import datetime
-from typing import List, Dict
 from elasticsearch import Elasticsearch
-import redis
 from neo4j import GraphDatabase
-from elastic_gen_sync import LectureMaterialSearcher
-from redis_sync import StudentSearch
+from typing import List, Dict
+import redis
+from typing import List, Dict, Optional
 
-ES_HOST = 'localhost'
-ES_PORT = 9200
-ES_USER = 'elastic'
-ES_PASS = 'secret'
-
-class AttendanceReporter:
-    def __init__(self, neo4j_driver, es_searcher, student_search):
-        self.driver = neo4j_driver
-        self.es_searcher = es_searcher
-        self.student_search = student_search
-
-    def generate_report(self, term: str, start_date: datetime, end_date: datetime) -> List[Dict]:
-        es = Elasticsearch(
-            hosts=[f"http://{ES_HOST}:{ES_PORT}"],
-            basic_auth=(ES_USER, ES_PASS),
+class LectureMaterialSearcher:
+    def __init__(self, es_host: str = "localhost", es_port: int = 9200,
+                 es_user: str = "elastic", es_password: str = "secret"):
+        self.es = Elasticsearch(
+            hosts=[f"http://{es_host}:{es_port}"],
+            basic_auth=(es_user, es_password),
             verify_certs=False
         )
-        es_resp = es.search(
-                index="lecture_materials",
-                query={
-                    "multi_match": {
-                        "query": term,
-                        "fields": ["lecture_name^3", "course_name^2", "content", "keywords"],
-                        "type": "best_fields",
-                        "fuzziness": "AUTO"
-                    }
-                },
-                size=100
-            )
 
-        lecture_ids = [hit['_source']['lecture_id'] for hit in es_resp['hits']['hits']]
+    def search(self, query: str) -> List[int]:
+        response = self.es.search(
+            index="lecture_materials",
+            query={
+                "multi_match": {
+                    "query": query,
+                    "fields": ["lecture_name^3", "course_name^2", "content", "keywords"],
+                    "type": "best_fields",
+                    "fuzziness": "AUTO"
+                }
+            }
+        )
+        # возвращаем список lecture_id (int)
+        return [hit['_source']['lecture_id'] for hit in response['hits']['hits']]
 
-        # Step 1: Search lectures containing the term using Elasticsearch
-        print(lecture_ids)
+class LectureMaterialSearcher:
+    def __init__(self, es_host: str = "localhost", es_port: int = 9200,
+                 es_user: str = "elastic", es_password: str = "secret"):
+        self.es = Elasticsearch(
+            hosts=[f"http://{es_host}:{es_port}"],
+            basic_auth=(es_user, es_password),
+            verify_certs=False
+        )
 
+    def search(self, query: str) -> List[int]:
+        response = self.es.search(
+            index="lecture_materials",
+            query={
+                "multi_match": {
+                    "query": query,
+                    "fields": ["lecture_name^3", "course_name^2", "content", "keywords"],
+                    "type": "best_fields",
+                    "fuzziness": "AUTO"
+                }
+            }
+        )
+        return [hit['_source']['lecture_id'] for hit in response['hits']['hits']]
+
+class AttendanceFinder:
+    def __init__(
+        self,
+        uri: str = 'bolt://localhost:7687',
+        user: str = 'neo4j',
+        password: str = 'strongpassword'
+    ):
+        self.driver = GraphDatabase.driver(uri, auth=(user, password))
+
+    def close(self):
+        self.driver.close()
+
+    def find_worst_attendees(
+        self,
+        lecture_ids: List[int],
+        top_n: int = 10,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None
+    ) -> List[Dict]:
+        return self._find_attendance(
+            lecture_ids,
+            limit=top_n,
+            worst=True,
+            start_date=start_date,
+            end_date=end_date
+        )
+
+    def get_attendance_summary(
+        self,
+        lecture_ids: List[int],
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None
+    ) -> List[Dict]:
+        return self._find_attendance(
+            lecture_ids,
+            limit=None,
+            worst=False,
+            start_date=start_date,
+            end_date=end_date
+        )
+
+    def _find_attendance(
+        self,
+        lecture_ids: List[int],
+        limit: Optional[int] = None,
+        worst: bool = True,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None
+    ) -> List[Dict]:
         if not lecture_ids:
             return []
 
-        # Step 2: Query Neo4j to calculate attendance percentages
-        cypher_query = """
-// 1. Студенты в группах
-MATCH (s:Student)-[:MEMBER_OF]->(g:Group)
+        query = '''
+        UNWIND $lecture_ids AS lid
+        MATCH (l:Lecture {postgres_id: lid})<-[:OF_LECTURE]-(e:ScheduleEvent)
+        '''
 
-// 2. Сессии этих групп и связанные лекции
-MATCH (ss:Session)-[:FOR_GROUP]->(g)
-MATCH (l:Lecture)-[:HAS_SESSION]->(ss)
+        if start_date is not None and end_date is not None:
+            query += '''
+        WHERE e.date >= date($start_date) AND e.date <= date($end_date)
+            '''
+        query += '''
+        MATCH (g:Group)-[:SCHEDULED_FOR]->(e)
+        MATCH (st:Student)-[:MEMBER_OF]->(g)
+        OPTIONAL MATCH (st)-[a:ATTENDED]->(e)
+        WITH st.postgres_id AS studentId, st.name AS studentName,
+             collect(coalesce(a.attended, false)) AS flags
+        WITH studentId, studentName,
+             size([f IN flags WHERE f])    AS attendedCount,
+             size(flags)                   AS totalCount
+        WHERE totalCount > 0
+        RETURN studentId, studentName,
+               attendedCount,
+               totalCount,
+               round(toFloat(attendedCount) / totalCount * 100, 2) AS attendancePercent
+        '''
+        if worst:
+            query += '\nORDER BY attendancePercent ASC'
+        else:
+            query += '\nORDER BY studentName ASC'
 
-// 3. Фильтрация по списку ID лекций и по диапазону дат (без учёта времени)
-WHERE l.id IN $lecture_ids
-  AND date(datetime(ss.date)) >= date($start_date)
-  AND date(datetime(ss.date)) <= date($end_date)
+        if limit is not None:
+            query += '\nLIMIT $limit'
 
-// 4. Опционально — факт посещения студентом каждой сессии
-OPTIONAL MATCH (s)-[a:ATTENDANCE]->(ss)
-
-// 5. Агрегация: общее число сессий и число посещённых
-WITH 
-  s,
-  COUNT(DISTINCT ss) AS total_sessions,
-  SUM(
-    CASE WHEN a.attended = true THEN 1 
-         ELSE 0 
-    END
-  ) AS attended_sessions
-
-// 6. Только студенты с хотя бы одной сессией
-WHERE total_sessions > 0
-
-// 7. Расчёт процента и сортировка
-RETURN 
-  s.id AS student_id,
-  100.0 * attended_sessions / total_sessions AS attendance_percent
-ORDER BY attendance_percent ASC
-LIMIT 10;
-        """
+        params: Dict[str, any] = {'lecture_ids': lecture_ids}
+        if limit is not None:
+            params['limit'] = limit
+        if start_date is not None and end_date is not None:
+            params['start_date'] = start_date
+            params['end_date'] = end_date
 
         with self.driver.session() as session:
-            result = session.run(
-                cypher_query,
-                lecture_ids=lecture_ids,
-                start_date=start_date.strftime("%Y-%m-%d"),
-                end_date=end_date.strftime("%Y-%m-%d")
-            )
-            student_records = [
-                {
-                    "student_id": record["student_id"],
-                    "attendance_percent": round(record["attendance_percent"], 2)
-                }
-                for record in result
-            ]
-            print(student_records)
+            result = session.run(query, **params)
+            return [record.data() for record in result]
+        
+if __name__ == '__main__':
+    term = "физика"
+    searcher = LectureMaterialSearcher(es_password="secret")
+    lecture_ids = searcher.search(term)
+    print(f"Найдены лекции: {lecture_ids}")
 
-        report = []
-        for record in student_records:
-            student_info = self.student_search.get_student_full(record["student_id"])
-            if student_info:
-                report.append({
-                    "student_info": student_info,
-                    "attendance_percent": record["attendance_percent"],
-                    "report_period": {
-                        "start": start_date.strftime("%Y-%m-%d"),
-                        "end": end_date.strftime("%Y-%m-%d")
-                    },
-                    "search_term": term
-                })
+    finder = AttendanceFinder()
+    r = redis.Redis(host='localhost', port=6379, decode_responses=True)
 
-        return report
-    
-if __name__ == "__main__":
-    neo4j_driver = GraphDatabase.driver("bolt://localhost:7687", auth=("neo4j", "strongpassword"))
-    es_searcher = LectureMaterialSearcher()
-    student_search = StudentSearch()
+    start = "2023-09-01"
+    end   = "2023-12-31"
 
-    # Создание репортера
-    reporter = AttendanceReporter(neo4j_driver, es_searcher, student_search)
+    try:
+        worst = finder.find_worst_attendees(
+            lecture_ids,
+            top_n=10,
+            start_date=start,
+            end_date=end
+        )
+        if worst:
+            print("\n10 студентов с худшей посещаемостью среди обязанных присутствовать:")
+            for idx, rec in enumerate(worst, 1):
+                redis_info = r.hgetall(f"student:{rec['studentId']}")
+                info_str = f"[Redis] Name: {redis_info.get('name')}, Age: {redis_info.get('age')}, Mail: {redis_info.get('mail')}, Group: {redis_info.get('group')}"
+                print(f"{idx}. {rec['studentName']} — {rec['attendancePercent']}% ({rec['attendedCount']}/{rec['totalCount']}) {info_str}")
+        else:
+            print("Нет данных о посетителях для найденных лекций или студенты не обязаны были присутствовать.")
 
-    # Генерация отчета
-    report = reporter.generate_report(
-        term="системы",
-        start_date=datetime(2023, 1, 1),
-        end_date=datetime(2023, 12, 31)
-    )
+        summary = finder.get_attendance_summary(
+            lecture_ids,
+            start_date=start,
+            end_date=end
+        )
+        if summary:
+            print("\nСводка посещаемости по всем студентам:")
+            for rec in summary:
+                redis_info = r.hgetall(f"student:{rec['studentId']}")
+                info_str = f"[Redis] Name: {redis_info.get('name')}, Age: {redis_info.get('age')}, Mail: {redis_info.get('mail')}, Group: {redis_info.get('group')}"
+                print(f"{rec['studentName']}: {rec['attendancePercent']}% ({rec['attendedCount']}/{rec['totalCount']}) {info_str}")
+        else:
+            print("Нет данных для сводки посещаемости.")
 
-    # Вывод результатов
-    for entry in report:
-        print(f"Student: {entry['student_info']}")
-        print(f"Attendance: {entry['attendance_percent']}%")
-        print(f"Period: {entry['report_period']['start']} - {entry['report_period']['end']}")
-        print(f"Term: {entry['search_term']}\n")
+    finally:
+        finder.close()
+        r.close()

@@ -105,7 +105,7 @@ class DatabaseCleaner:
             return False
 
     def clean_postgres(self):
-        """Очистка всех таблиц в PostgreSQL"""
+        """Очистка всех таблиц и сброс последовательностей ID в PostgreSQL"""
         try:
             with self.connections['postgres'].cursor() as cursor:
                 # Получаем список всех таблиц
@@ -121,12 +121,33 @@ class DatabaseCleaner:
                     logger.info("PostgreSQL: Нет таблиц для очистки")
                     return True
                 
+                # Отключаем триггеры для избежания каскадных ограничений
+                cursor.execute("SET session_replication_role = 'replica';")
+                
                 # Очищаем каждую таблицу
                 for table in tables:
                     cursor.execute(f'TRUNCATE TABLE "{table}" CASCADE')
                 
+                # Получаем список всех последовательностей
+                cursor.execute("""
+                    SELECT sequence_name 
+                    FROM information_schema.sequences 
+                    WHERE sequence_schema = 'public'
+                """)
+                sequences = [row[0] for row in cursor.fetchall()]
+                
+                # Сбрасываем каждую последовательность
+                for sequence in sequences:
+                    try:
+                        cursor.execute(f'ALTER SEQUENCE "{sequence}" RESTART WITH 1;')
+                    except Exception as seq_error:
+                        logger.warning(f"Не удалось сбросить последовательность {sequence}: {seq_error}")
+                
+                # Включаем триггеры обратно
+                cursor.execute("SET session_replication_role = 'origin';")
+                
                 self.connections['postgres'].commit()
-                logger.info(f"PostgreSQL: Очищено {len(tables)} таблиц")
+                logger.info(f"PostgreSQL: Очищено {len(tables)} таблиц и сброшено {len(sequences)} последовательностей")
                 return True
                 
         except Exception as e:
